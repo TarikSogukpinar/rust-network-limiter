@@ -22,8 +22,6 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
-
     let Cli {
         mut interface_index,
     } = Cli::parse();
@@ -32,9 +30,9 @@ async fn main() -> anyhow::Result<()> {
     let driver = Ndisapi::new("NDISRD").expect("WinpkFilter driver could not be loaded!");
     let adapters = driver.get_tcpip_bound_adapters_info()?;
 
-    info!("Available adapters:");
+    println!("Available adapters:");
     for (idx, adapter) in adapters.iter().enumerate() {
-        info!("Index {}: {}", idx + 1, adapter.get_name());
+        println!("Index {}: {}", idx + 1, adapter.get_name());
     }
 
     if interface_index + 1 > adapters.len() {
@@ -49,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
 
     driver.set_adapter_mode(adapter_handle, FilterFlags::MSTCP_FLAG_SENT_TUNNEL)?;
 
-    let (tx, rx): (Sender<IntermediateBuffer>, Receiver<IntermediateBuffer>) = mpsc::channel(100);
+    let (tx, rx): (Sender<IntermediateBuffer>, Receiver<IntermediateBuffer>) = mpsc::channel(1000);
 
     let upload_limiter = Arc::new(Mutex::new(TokenBucket::new(6_250))); // 1 Mbps limit
 
@@ -64,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     loop {
         let mut packet = IntermediateBuffer::default();
         unsafe {
-            WaitForSingleObject(event, u32::MAX);
+            WaitForSingleObject(event, 1000);
         }
 
         loop {
@@ -271,14 +269,15 @@ impl TokenBucket {
     async fn consume(&mut self, amount: usize) -> bool {
         self.refill();
 
+        //edited added sleep function
         if self.tokens >= amount {
             self.tokens -= amount;
             true
         } else {
-            // Not enough tokens, wait
             let wait_time =
                 Duration::from_secs_f64((amount - self.tokens) as f64 / self.rate as f64);
-            sleep(wait_time).await;
+            let min_wait_time = Duration::from_millis(10);
+            sleep(wait_time.min(min_wait_time)).await;
             self.refill();
             if self.tokens >= amount {
                 self.tokens -= amount;
