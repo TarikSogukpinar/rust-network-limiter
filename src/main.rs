@@ -1,4 +1,6 @@
 use clap::Parser;
+use env_logger;
+use log::info;
 use ndisapi::{EthRequest, EthRequestMut, FilterFlags, IntermediateBuffer, Ndisapi};
 use smoltcp::wire::{
     EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket,
@@ -20,6 +22,8 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    env_logger::init();
+
     let Cli {
         mut interface_index,
     } = Cli::parse();
@@ -28,9 +32,9 @@ async fn main() -> anyhow::Result<()> {
     let driver = Ndisapi::new("NDISRD").expect("WinpkFilter driver could not be loaded!");
     let adapters = driver.get_tcpip_bound_adapters_info()?;
 
-    println!("Available adapters:");
+    info!("Available adapters:");
     for (idx, adapter) in adapters.iter().enumerate() {
-        println!("Index {}: {}", idx + 1, adapter.get_name());
+        info!("Index {}: {}", idx + 1, adapter.get_name());
     }
 
     if interface_index + 1 > adapters.len() {
@@ -47,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
 
     let (tx, rx): (Sender<IntermediateBuffer>, Receiver<IntermediateBuffer>) = mpsc::channel(100);
 
-    let upload_limiter = Arc::new(Mutex::new(TokenBucket::new(100_000))); // 1 Mbps limit
+    let upload_limiter = Arc::new(Mutex::new(TokenBucket::new(6_250))); // 1 Mbps limit
 
     let driver_clone = driver.clone();
     let adapter_handle_clone = adapter_handle;
@@ -70,7 +74,10 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
 
-            tx.send(packet.clone()).await.ok();
+            if tx.send(packet.clone()).await.is_err() {
+                // Hata yönetimi
+                break;
+            }
         }
 
         let _ = unsafe { ResetEvent(event) };
@@ -92,25 +99,84 @@ async fn process_packets(
     while let Some(packet) = rx.recv().await {
         let length = packet.get_length() as usize;
 
-        // Print packet information for debugging
-        print_packet_info(&packet).await;
-
-        // Upload limit check
-        {
-            let mut limiter = upload_limiter.lock().await;
-            if !limiter.consume(length).await {
-                // If limit exceeded, drop the packet
-                println!("Upload limit reached, dropping packet");
-                continue; // Don't send the packet, effectively dropping it
-            }
+        // Kontrol paketi mi?
+        if is_control_packet(&packet) {
+            // Kontrol paketlerini sınırlamadan geçirin
+            send_packet_to_adapter(&driver, adapter_handle, &packet).await;
+            continue;
         }
 
-        // Send the packet back to the adapter
-        let mut packet_request = EthRequest::new(adapter_handle);
-        packet_request.set_packet(&packet);
-        driver
-            .send_packet_to_adapter(&packet_request)
-            .expect("Failed to send packet to adapter");
+        // Upload limitini kontrol edin ve gerekirse bekleyin
+        {
+            let mut limiter = upload_limiter.lock().await;
+            limiter.consume(length).await;
+        }
+
+        // Paketi adaptöre geri gönderin
+        send_packet_to_adapter(&driver, adapter_handle, &packet).await;
+    }
+}
+
+fn is_control_packet(packet: &IntermediateBuffer) -> bool {
+    let eth_frame = EthernetFrame::new_unchecked(packet.get_data());
+
+    match eth_frame.ethertype() {
+        EthernetProtocol::Ipv4 => {
+            let ipv4_packet = Ipv4Packet::new_unchecked(eth_frame.payload());
+
+            match ipv4_packet.next_header() {
+                IpProtocol::Tcp => {
+                    let tcp_packet = TcpPacket::new_unchecked(ipv4_packet.payload());
+
+                    let is_control = tcp_packet.syn() || tcp_packet.fin() || tcp_packet.rst();
+
+                    let is_ack_only = tcp_packet.payload().is_empty() && tcp_packet.ack();
+
+                    is_control || is_ack_only
+                }
+                IpProtocol::Icmp => true, // ICMP paketleri
+                IpProtocol::Udp => {
+                    // DNS trafiğini kontrol edin (port 53)
+                    let udp_packet = UdpPacket::new_unchecked(ipv4_packet.payload());
+                    udp_packet.src_port() == 53 || udp_packet.dst_port() == 53
+                }
+                _ => false,
+            }
+        }
+        EthernetProtocol::Ipv6 => {
+            let ipv6_packet = Ipv6Packet::new_unchecked(eth_frame.payload());
+
+            match ipv6_packet.next_header() {
+                IpProtocol::Tcp => {
+                    let tcp_packet = TcpPacket::new_unchecked(ipv6_packet.payload());
+
+                    let is_control = tcp_packet.syn() || tcp_packet.fin() || tcp_packet.rst();
+
+                    let is_ack_only = tcp_packet.payload().is_empty() && tcp_packet.ack();
+
+                    is_control || is_ack_only
+                }
+                IpProtocol::Icmpv6 => true, // ICMPv6 paketleri
+                IpProtocol::Udp => {
+                    let udp_packet = UdpPacket::new_unchecked(ipv6_packet.payload());
+                    udp_packet.src_port() == 53 || udp_packet.dst_port() == 53
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+async fn send_packet_to_adapter(
+    driver: &Ndisapi,
+    adapter_handle: HANDLE,
+    packet: &IntermediateBuffer,
+) {
+    let mut packet_request = EthRequest::new(adapter_handle);
+    packet_request.set_packet(packet);
+    if let Err(e) = driver.send_packet_to_adapter(&packet_request) {
+        // Hata yönetimi
     }
 }
 
@@ -120,7 +186,7 @@ async fn print_packet_info(packet: &IntermediateBuffer) {
     match eth_frame.ethertype() {
         EthernetProtocol::Ipv4 => {
             let ipv4_packet = Ipv4Packet::new_unchecked(eth_frame.payload());
-            println!(
+            info!(
                 "IPv4 Packet: {} -> {}",
                 ipv4_packet.src_addr(),
                 ipv4_packet.dst_addr()
@@ -128,7 +194,7 @@ async fn print_packet_info(packet: &IntermediateBuffer) {
             match ipv4_packet.next_header() {
                 IpProtocol::Tcp => {
                     let tcp_packet = TcpPacket::new_unchecked(ipv4_packet.payload());
-                    println!(
+                    info!(
                         "TCP Segment: {} -> {}",
                         tcp_packet.src_port(),
                         tcp_packet.dst_port()
@@ -136,20 +202,20 @@ async fn print_packet_info(packet: &IntermediateBuffer) {
                 }
                 IpProtocol::Udp => {
                     let udp_packet = UdpPacket::new_unchecked(ipv4_packet.payload());
-                    println!(
+                    info!(
                         "UDP Datagram: {} -> {}",
                         udp_packet.src_port(),
                         udp_packet.dst_port()
                     );
                 }
                 _ => {
-                    println!("Other IPv4 Protocol: {:?}", ipv4_packet.next_header());
+                    info!("Other IPv4 Protocol: {:?}", ipv4_packet.next_header());
                 }
             }
         }
         EthernetProtocol::Ipv6 => {
             let ipv6_packet = Ipv6Packet::new_unchecked(eth_frame.payload());
-            println!(
+            info!(
                 "IPv6 Packet: {} -> {}",
                 ipv6_packet.src_addr(),
                 ipv6_packet.dst_addr()
@@ -157,7 +223,7 @@ async fn print_packet_info(packet: &IntermediateBuffer) {
             match ipv6_packet.next_header() {
                 IpProtocol::Tcp => {
                     let tcp_packet = TcpPacket::new_unchecked(ipv6_packet.payload());
-                    println!(
+                    info!(
                         "TCP Segment: {} -> {}",
                         tcp_packet.src_port(),
                         tcp_packet.dst_port()
@@ -165,22 +231,22 @@ async fn print_packet_info(packet: &IntermediateBuffer) {
                 }
                 IpProtocol::Udp => {
                     let udp_packet = UdpPacket::new_unchecked(ipv6_packet.payload());
-                    println!(
+                    info!(
                         "UDP Datagram: {} -> {}",
                         udp_packet.src_port(),
                         udp_packet.dst_port()
                     );
                 }
                 _ => {
-                    println!("Other IPv6 Protocol: {:?}", ipv6_packet.next_header());
+                    info!("Other IPv6 Protocol: {:?}", ipv6_packet.next_header());
                 }
             }
         }
         EthernetProtocol::Arp => {
-            println!("ARP Packet");
+            info!("ARP Packet");
         }
         _ => {
-            println!("Other Ethernet Protocol: {:?}", eth_frame.ethertype());
+            info!("Other Ethernet Protocol: {:?}", eth_frame.ethertype());
         }
     }
 }
