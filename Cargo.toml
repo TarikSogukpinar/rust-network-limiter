@@ -12,9 +12,21 @@ futures = "0.3.31"
 ndisapi = "0.6.0"
 prettytable = "0.10.0"
 smoltcp = "0.11.0"
-tokio = {version = "1.41.0", features = ["full"]}
-windows = { version = "0.58.0", features = [
+tokio = { version = "1.41.0", features = ["full"] }
+
+
+[dependencies.windows]
+version = "0.54.0"
+features = [
     "Win32_Foundation",
-    "Win32_System_Threading",
     "Win32_Security",
-] }
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_System_SystemInformation",
+    ]
+
